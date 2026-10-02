@@ -938,3 +938,160 @@ Les décisions suivantes ne sont pas encore figées :
 - technologies d'implémentation des agents et du central.
 
 Ces valeurs et technologies seront choisies plus tard à partir des besoins, des tests et des contraintes réelles.
+
+
+## Algo de construction d'un lot
+
+'''
+// Version provisoire à compléter plus târd
+// reste encore quelques éléments à gérer
+
+// réveil par :
+// - signal N-1 -> N
+// - timer arrivé à échéance
+// - timer_retry arrivé à échéance
+
+function constructeur
+
+    erreur_transaction = 0
+
+    // backoff_actuel est initialisé à 2 secondes au démarrage du programme
+    // backoff_max est une valeur maximale choisie
+
+
+    // calculer échéance
+    if(cpt > 0) then 
+        échéance = plus_ancienne_date(métriques) + X
+    endif
+
+
+    while (
+        cpt >= N
+        OR
+        (cpt > 0 AND échéance <= maintenant)
+    )
+
+        transaction_reussie = 0
+
+
+        if(cpt >= N) then
+
+            transaction
+            créer un lot de N métriques
+            supprimer les métriques du stockage temporaire
+
+            if(commit réussit) then
+                transaction_reussie = 1
+            endif
+            
+            
+            // mise à jour du cpt
+            if(transaction_reussie) then 
+
+                cpt = cpt - nb_metrique_supprimee
+
+                // la série d'échecs est terminée
+                backoff_actuel = 2
+
+                transaction_reussie = 0 
+
+            else
+
+                // la transaction a échoué
+                // les métriques restent dans le stockage temporaire
+                // donc cpt ne change pas
+
+                erreur_transaction = 1
+
+                // programmer une nouvelle tentative
+                timer_retry = backoff_actuel
+
+                // préparer le délai pour un éventuel prochain échec
+                backoff_actuel = min(
+                    backoff_actuel * 2,
+                    backoff_max
+                )
+
+                // éviter de recommencer immédiatement le while
+                break
+
+            endif
+        
+
+        else
+
+            // ici :
+            // 0 < cpt < N
+            // ET échéance <= maintenant
+
+            transaction
+            créer un lot de cpt métriques
+            supprimer les métriques du stockage temporaire
+
+            if(commit réussit) then
+                transaction_reussie = 1
+            endif
+            
+            
+            // mise à jour du cpt
+            if(transaction_reussie) then 
+
+                cpt = cpt - nb_metrique_supprimee
+
+                // la série d'échecs est terminée
+                backoff_actuel = 2
+
+                transaction_reussie = 0 
+            
+            else
+
+                // la transaction a échoué
+                // les métriques restent dans le stockage temporaire
+                // donc cpt ne change pas
+
+                erreur_transaction = 1
+
+                // programmer une nouvelle tentative
+                timer_retry = backoff_actuel
+
+                // préparer le délai pour un éventuel prochain échec
+                backoff_actuel = min(
+                    backoff_actuel * 2,
+                    backoff_max
+                )
+
+                // éviter une boucle infinie de retry
+                break
+
+            endif
+
+        endif
+
+
+        // recalculer échéance après une transaction réussie
+        if(cpt > 0) then
+            échéance = plus_ancienne_date(métriques) + X
+        endif
+
+    endwhile
+
+
+
+    // programmer/reprogrammer le timer normal uniquement
+    // si on n'est pas sorti à cause d'une erreur de transaction
+    if(erreur_transaction = 0 AND cpt > 0) then
+
+        // forcément :
+        // 0 < cpt < N
+        // ET échéance > maintenant
+
+        timer = plus_ancienne_date(métriques) + X - maintenant
+
+    endif
+
+
+    rendormir le constructeur
+
+endfunction
+
+'''
