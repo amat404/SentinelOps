@@ -1,7 +1,7 @@
 # SentinelOps - Cahier des charges
 
 > Document de travail - V1 en cours de conception  
-> Dernière mise à jour : 26/09/2026
+> Dernière mise à jour : 10/10/2026
 
 ## 1. Objectif du projet
 
@@ -951,16 +951,34 @@ Ces valeurs et technologies seront choisies plus tard à partir des besoins, des
 // - timer arrivé à échéance
 // - timer_retry arrivé à échéance
 
+
 function constructeur
 
     erreur_transaction = 0
 
     // backoff_actuel est initialisé à 2 secondes au démarrage du programme
     // backoff_max est une valeur maximale choisie
+    // prochaine_tentative_autorisee est initialisée à null
+
+
+    // vérifier d'abord si une transaction est encore en backoff
+    if(
+        prochaine_tentative_autorisee != null
+        AND maintenant < prochaine_tentative_autorisee
+    ) then
+
+        // aucune transaction n'est autorisée pour le moment
+        // le timer X peut être ignoré s'il a réveillé le constructeur
+        timer_retry = prochaine_tentative_autorisee - maintenant
+
+        rendormir le constructeur
+        return
+
+    endif
 
 
     // calculer échéance
-    if(cpt > 0) then 
+    if(cpt > 0) then
         échéance = plus_ancienne_date(métriques) + X
     endif
 
@@ -976,24 +994,70 @@ function constructeur
 
         if(cpt >= N) then
 
+            nb_metriques_lot = N
+
             transaction
-            créer un lot de N métriques
-            supprimer les métriques du stockage temporaire
+
+            // sélectionner et figer les N métriques les plus anciennes
+            // ordre : timestamp puis id
+            metriques_selectionnees =
+                sélectionner nb_metriques_lot métriques
+                les plus anciennes
+                triées par timestamp puis id
+
+            // vérifier que cpt correspond toujours à l'état réel du stockage
+            if(nombre(metriques_selectionnees) < nb_metriques_lot) then
+
+                rollback
+
+                // cpt est désynchronisé du stockage persistant
+                // le stockage est la source de vérité
+                cpt = nombre réel de métriques
+                      dans le stockage temporaire
+
+                if(cpt > 0) then
+                    échéance = plus_ancienne_date(métriques) + X
+                endif
+
+                // reprendre la décision avec le nouvel état
+                continue
+
+            endif
+
+
+            // figer précisément les métriques du lot par leurs ids
+            ids_selectionnes = ids(metriques_selectionnees)
+
+            créer un lot avec metriques_selectionnees
+
+            // supprimer exactement les métriques mises dans le lot
+            supprimer du stockage temporaire
+                les métriques dont id appartient à ids_selectionnes
+
 
             if(commit réussit) then
                 transaction_reussie = 1
+            else
+                rollback
             endif
-            
-            
-            // mise à jour du cpt
-            if(transaction_reussie) then 
 
+
+            // mise à jour du cpt
+            if(transaction_reussie) then
+
+                nb_metrique_supprimee =
+                    nombre(metriques_selectionnees)
+
+                // mise à jour atomique du compteur
+                // les collecteurs peuvent avoir ajouté
+                // de nouvelles métriques pendant la transaction
                 cpt = cpt - nb_metrique_supprimee
 
                 // la série d'échecs est terminée
                 backoff_actuel = 2
+                prochaine_tentative_autorisee = null
 
-                transaction_reussie = 0 
+                transaction_reussie = 0
 
             else
 
@@ -1003,8 +1067,14 @@ function constructeur
 
                 erreur_transaction = 1
 
+                // date à partir de laquelle une nouvelle
+                // transaction sera autorisée
+                prochaine_tentative_autorisee =
+                    maintenant + backoff_actuel
+
                 // programmer une nouvelle tentative
-                timer_retry = backoff_actuel
+                timer_retry =
+                    prochaine_tentative_autorisee - maintenant
 
                 // préparer le délai pour un éventuel prochain échec
                 backoff_actuel = min(
@@ -1016,7 +1086,7 @@ function constructeur
                 break
 
             endif
-        
+
 
         else
 
@@ -1024,25 +1094,70 @@ function constructeur
             // 0 < cpt < N
             // ET échéance <= maintenant
 
+            // figer le nombre de métriques du lot partiel
+            nb_metriques_lot = cpt
+
             transaction
-            créer un lot de cpt métriques
-            supprimer les métriques du stockage temporaire
+
+            // sélectionner et figer exactement les métriques
+            // qui vont appartenir au lot
+            metriques_selectionnees =
+                sélectionner nb_metriques_lot métriques
+                les plus anciennes
+                triées par timestamp puis id
+
+
+            // vérifier que cpt correspond toujours à l'état réel du stockage
+            if(nombre(metriques_selectionnees) < nb_metriques_lot) then
+
+                rollback
+
+                // resynchroniser cpt avec la source de vérité
+                cpt = nombre réel de métriques
+                      dans le stockage temporaire
+
+                if(cpt > 0) then
+                    échéance = plus_ancienne_date(métriques) + X
+                endif
+
+                // reprendre la décision avec le nouvel état
+                continue
+
+            endif
+
+
+            // figer précisément les métriques par leurs ids
+            ids_selectionnes = ids(metriques_selectionnees)
+
+            créer un lot avec metriques_selectionnees
+
+            // supprimer exactement les mêmes métriques
+            supprimer du stockage temporaire
+                les métriques dont id appartient à ids_selectionnes
+
 
             if(commit réussit) then
                 transaction_reussie = 1
+            else
+                rollback
             endif
-            
-            
-            // mise à jour du cpt
-            if(transaction_reussie) then 
 
+
+            // mise à jour du cpt
+            if(transaction_reussie) then
+
+                nb_metrique_supprimee =
+                    nombre(metriques_selectionnees)
+
+                // mise à jour atomique du compteur
                 cpt = cpt - nb_metrique_supprimee
 
                 // la série d'échecs est terminée
                 backoff_actuel = 2
+                prochaine_tentative_autorisee = null
 
-                transaction_reussie = 0 
-            
+                transaction_reussie = 0
+
             else
 
                 // la transaction a échoué
@@ -1051,8 +1166,14 @@ function constructeur
 
                 erreur_transaction = 1
 
+                // date à partir de laquelle une nouvelle
+                // transaction sera autorisée
+                prochaine_tentative_autorisee =
+                    maintenant + backoff_actuel
+
                 // programmer une nouvelle tentative
-                timer_retry = backoff_actuel
+                timer_retry =
+                    prochaine_tentative_autorisee - maintenant
 
                 // préparer le délai pour un éventuel prochain échec
                 backoff_actuel = min(
@@ -1069,6 +1190,7 @@ function constructeur
 
 
         // recalculer échéance après une transaction réussie
+        // à partir de la nouvelle métrique la plus ancienne
         if(cpt > 0) then
             échéance = plus_ancienne_date(métriques) + X
         endif
@@ -1085,7 +1207,7 @@ function constructeur
         // 0 < cpt < N
         // ET échéance > maintenant
 
-        timer = plus_ancienne_date(métriques) + X - maintenant
+        timer = échéance - maintenant
 
     endif
 
@@ -1093,5 +1215,4 @@ function constructeur
     rendormir le constructeur
 
 endfunction
-
 '''
