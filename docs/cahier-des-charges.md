@@ -1,7 +1,7 @@
 # SentinelOps - Cahier des charges
 
 > Document de travail - V1 en cours de conception  
-> Dernière mise à jour : 10/10/2026
+> Dernière mise à jour : 15/10/2026
 
 ## 1. Objectif du projet
 
@@ -943,152 +943,155 @@ Ces valeurs et technologies seront choisies plus tard à partir des besoins, des
 ## Algo de construction d'un lot
 
 '''
-// Version provisoire à compléter plus târd
-// reste encore quelques éléments à gérer
+// Version provisoire à compléter
+// Le constructeur est le seul propriétaire de l'échéance X
+// et de la logique de backoff
 
-// réveil par :
-// - signal N-1 -> N
-// - timer arrivé à échéance
-// - timer_retry arrivé à échéance
+// Les collecteurs utilisent le même mutex pour modifier cpt
+
+// signaux possibles envoyés par les collecteurs :
+// - passage 0 -> 1
+// - passage N-1 -> N
+
+// Le constructeur peut aussi se réveiller par timeout :
+// - échéance X atteinte
+// - prochaine_tentative_autorisee atteinte
 
 
 function constructeur
 
-    erreur_transaction = 0
+    // initialisation une seule fois au démarrage
+    backoff_actuel = 2
+    backoff_max = valeur_max_choisie
 
-    // backoff_actuel est initialisé à 2 secondes au démarrage du programme
-    // backoff_max est une valeur maximale choisie
-    // prochaine_tentative_autorisee est initialisée à null
-
-
-    // vérifier d'abord si une transaction est encore en backoff
-    if(
-        prochaine_tentative_autorisee != null
-        AND maintenant < prochaine_tentative_autorisee
-    ) then
-
-        // aucune transaction n'est autorisée pour le moment
-        // le timer X peut être ignoré s'il a réveillé le constructeur
-        timer_retry = prochaine_tentative_autorisee - maintenant
-
-        rendormir le constructeur
-        return
-
-    endif
+    prochaine_tentative_autorisee = null
 
 
-    // calculer échéance
-    if(cpt > 0) then
-        échéance = plus_ancienne_date(métriques) + X
-    endif
+    // au démarrage ou redémarrage, on doit
+    // reconstruire cpt depuis le stockage persistant
+    lock(mutex)
+
+    cpt = nombre réel de métriques
+          dans le stockage temporaire
+
+    unlock(mutex)
 
 
-    while (
-        cpt >= N
-        OR
-        (cpt > 0 AND échéance <= maintenant)
-    )
 
-        transaction_reussie = 0
+    while(true)
 
+        lock(mutex)
+
+
+        /*
+         *    1- une transaction est encore en backoff
+        */
+
+        if(
+            prochaine_tentative_autorisee != null
+            AND maintenant < prochaine_tentative_autorisee
+        ) then
+
+            // attendre :
+            // - soit un signal
+            // - soit la fin du backoff
+            //
+            // wait_until(primitive condition) libère automatiquement le mutex
+            // pendant le sommeil et le reprend au réveil
+
+            wait_until(
+                condition_variable,
+                mutex,
+                prochaine_tentative_autorisee
+            )
+
+            unlock(mutex)
+
+            // après tout réveil :
+            // reprendre depuis le début
+            // pour revérifier l'état réel
+            continue
+
+        endif
+
+
+
+        /*
+         *  2- aucune métrique temporaire
+        */
+
+        if(cpt = 0) then
+
+            // aucun timer X n'est nécessaire
+            // attendre qu'un collecteur signale notamment 0 -> 1
+
+            wait(
+                condition_variable,
+                mutex
+            )
+
+            // au réveil, wait a repris le mutex
+
+            unlock(mutex)
+
+            // toujours revérifier l'état
+            continue
+
+        endif
+
+
+
+        /*
+         * 3- il y a au moins N métriques
+        */
 
         if(cpt >= N) then
 
+            // figer la décision pendant que le mutex est détenu
             nb_metriques_lot = N
 
-            transaction
+            // ne pas garder le mutex pendant
+            // la transaction en base
+            unlock(mutex)
 
-            // sélectionner et figer les N métriques les plus anciennes
-            // ordre : timestamp puis id
-            metriques_selectionnees =
-                sélectionner nb_metriques_lot métriques
-                les plus anciennes
-                triées par timestamp puis id
 
-            // vérifier que cpt correspond toujours à l'état réel du stockage
-            if(nombre(metriques_selectionnees) < nb_metriques_lot) then
+        else
 
-                rollback
+            /*
+             * 4- 0 < cpt < N
+            */
 
-                // cpt est désynchronisé du stockage persistant
-                // le stockage est la source de vérité
-                cpt = nombre réel de métriques
-                      dans le stockage temporaire
+            // le constructeur est propriétaire de échéance
+            échéance =
+                plus_ancienne_date(métriques) + X
 
-                if(cpt > 0) then
-                    échéance = plus_ancienne_date(métriques) + X
-                endif
 
-                // reprendre la décision avec le nouvel état
+            if(échéance > maintenant) then
+
+                // pas encore le moment de créer le lot partiel
+                //
+                // attendre :
+                // - soit un signal du collecteur
+                // - soit l'échéance X
+
+                wait_until(
+                    condition_variable,
+                    mutex,
+                    échéance
+                )
+
+                // au réveil, wait_until reprend le mutex
+
+                unlock(mutex)
+
+                // le réveil ne signifie pas
+                // "créer un lot immédiatement"
+                //
+                // on revient vérifier tout l'état
                 continue
 
             endif
 
-
-            // figer précisément les métriques du lot par leurs ids
-            ids_selectionnes = ids(metriques_selectionnees)
-
-            créer un lot avec metriques_selectionnees
-
-            // supprimer exactement les métriques mises dans le lot
-            supprimer du stockage temporaire
-                les métriques dont id appartient à ids_selectionnes
-
-
-            if(commit réussit) then
-                transaction_reussie = 1
-            else
-                rollback
-            endif
-
-
-            // mise à jour du cpt
-            if(transaction_reussie) then
-
-                nb_metrique_supprimee =
-                    nombre(metriques_selectionnees)
-
-                // mise à jour atomique du compteur
-                // les collecteurs peuvent avoir ajouté
-                // de nouvelles métriques pendant la transaction
-                cpt = cpt - nb_metrique_supprimee
-
-                // la série d'échecs est terminée
-                backoff_actuel = 2
-                prochaine_tentative_autorisee = null
-
-                transaction_reussie = 0
-
-            else
-
-                // la transaction a échoué
-                // les métriques restent dans le stockage temporaire
-                // donc cpt ne change pas
-
-                erreur_transaction = 1
-
-                // date à partir de laquelle une nouvelle
-                // transaction sera autorisée
-                prochaine_tentative_autorisee =
-                    maintenant + backoff_actuel
-
-                // programmer une nouvelle tentative
-                timer_retry =
-                    prochaine_tentative_autorisee - maintenant
-
-                // préparer le délai pour un éventuel prochain échec
-                backoff_actuel = min(
-                    backoff_actuel * 2,
-                    backoff_max
-                )
-
-                // éviter de recommencer immédiatement le while
-                break
-
-            endif
-
-
-        else
 
             // ici :
             // 0 < cpt < N
@@ -1097,122 +1100,207 @@ function constructeur
             // figer le nombre de métriques du lot partiel
             nb_metriques_lot = cpt
 
-            transaction
-
-            // sélectionner et figer exactement les métriques
-            // qui vont appartenir au lot
-            metriques_selectionnees =
-                sélectionner nb_metriques_lot métriques
-                les plus anciennes
-                triées par timestamp puis id
-
-
-            // vérifier que cpt correspond toujours à l'état réel du stockage
-            if(nombre(metriques_selectionnees) < nb_metriques_lot) then
-
-                rollback
-
-                // resynchroniser cpt avec la source de vérité
-                cpt = nombre réel de métriques
-                      dans le stockage temporaire
-
-                if(cpt > 0) then
-                    échéance = plus_ancienne_date(métriques) + X
-                endif
-
-                // reprendre la décision avec le nouvel état
-                continue
-
-            endif
-
-
-            // figer précisément les métriques par leurs ids
-            ids_selectionnes = ids(metriques_selectionnees)
-
-            créer un lot avec metriques_selectionnees
-
-            // supprimer exactement les mêmes métriques
-            supprimer du stockage temporaire
-                les métriques dont id appartient à ids_selectionnes
-
-
-            if(commit réussit) then
-                transaction_reussie = 1
-            else
-                rollback
-            endif
-
-
-            // mise à jour du cpt
-            if(transaction_reussie) then
-
-                nb_metrique_supprimee =
-                    nombre(metriques_selectionnees)
-
-                // mise à jour atomique du compteur
-                cpt = cpt - nb_metrique_supprimee
-
-                // la série d'échecs est terminée
-                backoff_actuel = 2
-                prochaine_tentative_autorisee = null
-
-                transaction_reussie = 0
-
-            else
-
-                // la transaction a échoué
-                // les métriques restent dans le stockage temporaire
-                // donc cpt ne change pas
-
-                erreur_transaction = 1
-
-                // date à partir de laquelle une nouvelle
-                // transaction sera autorisée
-                prochaine_tentative_autorisee =
-                    maintenant + backoff_actuel
-
-                // programmer une nouvelle tentative
-                timer_retry =
-                    prochaine_tentative_autorisee - maintenant
-
-                // préparer le délai pour un éventuel prochain échec
-                backoff_actuel = min(
-                    backoff_actuel * 2,
-                    backoff_max
-                )
-
-                // éviter une boucle infinie de retry
-                break
-
-            endif
+            unlock(mutex)
 
         endif
 
 
-        // recalculer échéance après une transaction réussie
-        // à partir de la nouvelle métrique la plus ancienne
-        if(cpt > 0) then
-            échéance = plus_ancienne_date(métriques) + X
+
+        /*
+        / CREER LE LOT
+        */
+        //
+        // À partir d'ici le mutex n'est plus détenu.
+        // Les collecteurs peuvent continuer à ajouter
+        // des métriques et modifier cpt
+
+
+        transaction_reussie = 0
+
+
+        transaction
+
+
+        // sélectionner précisément les métriques du lot
+        metriques_selectionnees =
+            sélectionner nb_metriques_lot métriques
+            les plus anciennes
+            triées par timestamp puis id
+
+
+
+        /*
+        / VERIFIER LA COHERENCE AVEC LE STOCKAGE
+        */
+
+        if(
+            nombre(metriques_selectionnees)
+            < nb_metriques_lot
+        ) then
+
+            rollback
+
+
+            // cpt est désynchronisé du stockage persistant.
+            // le stockage reste la source de vérité.
+
+            lock(mutex)
+
+            cpt =
+                nombre réel de métriques
+                dans le stockage temporaire
+
+            unlock(mutex)
+
+
+            // reprendre entièrement la décision
+            continue
+
         endif
+
+
+
+        
+        /*
+         * FIGER EXACTEMENT LES METRIQUES DU LOT
+        */
+
+        ids_selectionnes =
+            ids(metriques_selectionnees)
+
+
+        créer un lot avec metriques_selectionnees
+
+
+        // supprimer exactement les mêmes métriques
+        supprimer du stockage temporaire
+            les métriques dont id appartient à ids_selectionnes
+
+
+
+        /*
+         *  VALIDER LA TRANSACTION
+        */
+
+        if(commit réussit) then
+
+            transaction_reussie = 1
+
+        else
+
+            rollback
+
+        endif
+
+
+
+        /*
+         * TRANSACTION REUSSIE
+        */
+
+        if(transaction_reussie) then
+
+            nb_metrique_supprimee =
+                nombre(metriques_selectionnees)
+
+
+            // reprendre  le mutex 
+            // pour mettre à jour l'état partagé
+
+            lock(mutex)
+
+            // les collecteurs ont éventuellement ajouté
+            // des métriques pendant la transaction
+            //
+            // donc il ne faut pas faire cpt = 0
+
+            cpt =
+                cpt - nb_metrique_supprimee
+
+            unlock(mutex)
+
+
+            // fin de la série d'échecs
+            backoff_actuel = 2
+            prochaine_tentative_autorisee = null
+
+
+            // ne pas décider ici si on doit dormir
+            // ou refaire un lot
+            //
+            // revenir au début et réexaminer
+            // l'état actuel
+
+            continue
+
+        endif
+
+
+
+        /*
+         * TRANSACTION ECHOUEE
+        */
+
+        // rollback déjà effectué
+        //
+        // aucune métrique n'a été supprimée
+        // donc cpt reste inchangé
+
+
+        prochaine_tentative_autorisee =
+            maintenant + backoff_actuel
+
+
+        // préparer le délai du prochain échec éventuel
+
+        backoff_actuel =
+            min(
+                backoff_actuel * 2,
+                backoff_max
+            )
+
+
+        // revenir au début
+        //
+        // la prochaine itération verra que le backoff
+        // est actif et fera un wait_until jusqu'à
+        // prochaine_tentative_autorisee
+
+        continue
+
 
     endwhile
 
+endfunction
+'''
 
 
-    // programmer/reprogrammer le timer normal uniquement
-    // si on n'est pas sorti à cause d'une erreur de transaction
-    if(erreur_transaction = 0 AND cpt > 0) then
+// Le collecteur
 
-        // forcément :
-        // 0 < cpt < N
-        // ET échéance > maintenant
+'''
+function enregistrer_metrique(metrique)
 
-        timer = échéance - maintenant
+    enregistrer metrique
+    dans le stockage temporaire
+
+    lock(mutex)
+
+    ancien_cpt = cpt
+
+    cpt = cpt + 1
+
+
+    if(
+        ancien_cpt = 0
+        OR
+        ancien_cpt = N - 1
+    ) then
+
+        signal(condition_variable)
 
     endif
 
-
-    rendormir le constructeur
+    unlock(mutex)
 
 endfunction
 '''
